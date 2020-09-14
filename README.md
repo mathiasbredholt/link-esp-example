@@ -1,2 +1,2 @@
-# link-idf-example
-Example for using link-idf
+# link-esp-example
+Example for using link-esp
