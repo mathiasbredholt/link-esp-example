@@ -11,22 +11,12 @@
 #define LED GPIO_NUM_2
 #define PRINT_LINK_STATE false
 
-unsigned int if_nametoindex(const char* ifName)
-{
-  return 0;
-}
-
-char* if_indextoname(unsigned int ifIndex, char* ifName)
-{
-  return nullptr;
-}
-
 void IRAM_ATTR timer_group0_isr(void* userParam)
 {
   static BaseType_t xHigherPriorityTaskWoken = pdFALSE;
 
-  TIMERG0.int_clr_timers.t0 = 1;
-  TIMERG0.hw_timer[0].config.alarm_en = 1;
+  timer_group_clr_intr_status_in_isr(TIMER_GROUP_0, TIMER_0);
+  timer_group_enable_alarm_in_isr(TIMER_GROUP_0, TIMER_0);
 
   xSemaphoreGiveFromISR(userParam, &xHigherPriorityTaskWoken);
   if (xHigherPriorityTaskWoken)
@@ -73,6 +63,7 @@ void printTask(void* userParam)
 
 void tickTask(void* userParam)
 {
+  SemaphoreHandle_t handle = static_cast<SemaphoreHandle_t>(userParam);
   ableton::Link link(120.0f);
   link.enable(true);
 
@@ -85,7 +76,7 @@ void tickTask(void* userParam)
 
   while (true)
   {
-    xSemaphoreTake(userParam, portMAX_DELAY);
+    xSemaphoreTake(handle, portMAX_DELAY);
 
     const auto state = link.captureAudioSessionState();
     const auto phase = state.phaseAtTime(link.clock().micros(), 1.);
@@ -97,7 +88,7 @@ void tickTask(void* userParam)
 extern "C" void app_main()
 {
   ESP_ERROR_CHECK(nvs_flash_init());
-  tcpip_adapter_init();
+  esp_netif_init();
   ESP_ERROR_CHECK(esp_event_loop_create_default());
   ESP_ERROR_CHECK(example_connect());
 
