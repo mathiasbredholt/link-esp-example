@@ -81,7 +81,6 @@ void tickTask(void* userParam)
     const auto state = link.captureAudioSessionState();
     const auto phase = state.phaseAtTime(link.clock().micros(), 1.);
     gpio_set_level(LED, fmodf(phase, 1.) < 0.1);
-    portYIELD();
   }
 }
 
