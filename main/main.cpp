@@ -18,6 +18,10 @@
 #define TX_PIN 15
 #define RX_PIN 12
 
+int gDelta = 0;
+int gRuntime = 0;
+int gMaxRuntime = -1;
+
 void IRAM_ATTR timer_group0_isr(void* userParam)
 {
   static BaseType_t xHigherPriorityTaskWoken = pdFALSE;
@@ -25,7 +29,7 @@ void IRAM_ATTR timer_group0_isr(void* userParam)
   timer_group_clr_intr_status_in_isr(TIMER_GROUP_0, TIMER_0);
   timer_group_enable_alarm_in_isr(TIMER_GROUP_0, TIMER_0);
 
-  xSemaphoreGiveFromISR(userParam, &xHigherPriorityTaskWoken);
+  vTaskNotifyGiveFromISR(userParam, &xHigherPriorityTaskWoken);
   if (xHigherPriorityTaskWoken)
   {
     portYIELD_FROM_ISR();
@@ -57,14 +61,19 @@ void printTask(void* userParam)
 
   while (true)
   {
-    const auto sessionState = link->captureAppSessionState();
-    const auto numPeers = link->numPeers();
-    const auto time = link->clock().micros();
-    const auto beats = sessionState.beatAtTime(time, quantum);
-    std::cout << std::defaultfloat << "| peers: " << numPeers << " | "
-              << "tempo: " << sessionState.tempo() << " | " << std::fixed
-              << "beats: " << beats << " |" << std::endl;
-    vTaskDelay(800 / portTICK_PERIOD_MS);
+    // const auto sessionState = link->captureAppSessionState();
+    // const auto numPeers = link->numPeers();
+    // const auto time = link->clock().micros();
+    // const auto beats = sessionState.beatAtTime(time, quantum);
+    // std::cout << std::defaultfloat << "| peers: " << numPeers << " | "
+    //           << "tempo: " << sessionState.tempo() << " | " << std::fixed
+    //           << "beats: " << beats << " |" << std::endl;
+    std::cout << "delta: " << gDelta << " runtime: " << gRuntime << "\n";
+    if (gMaxRuntime > -1) {
+      std::cout << "ERROR: Task didn't finish in time (" << gMaxRuntime << ")\n";
+      gMaxRuntime = -1;
+    }
+    vTaskDelay(100 / portTICK_PERIOD_MS);
   }
 }
 
@@ -90,7 +99,6 @@ void initUartPort(uart_port_t port, int txPin, int rxPin)
 
 void tickTask(void* userParam)
 {
-  SemaphoreHandle_t handle = static_cast<SemaphoreHandle_t>(userParam);
   ableton::Link link(120.0f);
   link.enable(true);
 
@@ -105,21 +113,17 @@ void tickTask(void* userParam)
 
   while (true)
   {
-    xSemaphoreTake(handle, portMAX_DELAY);
+    ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+
+    int64_t before = esp_timer_get_time();
 
     const auto state = link.captureAudioSessionState();
-    const auto phase = state.phaseAtTime(link.clock().micros(), 1.);
-    const auto beat = state.beatAtTime(link.clock().micros(), 1.);
-    gpio_set_level(LED, fmodf(phase, 1.) < 0.1);
 
     // MIDI clock
     {
-      // static int lastState;
-      // const int currentState = beat * 24;
       static float lastClkPhase; 
       const float clkPhase = state.phaseAtTime(link.clock().micros(), 1.0/24.0);
 
-      // if (currentState > lastState) {
       if (clkPhase - lastClkPhase < 0) {
         if (USB_MIDI)
         {
@@ -131,9 +135,19 @@ void tickTask(void* userParam)
           uint8_t data[1] = { 0xf8 };
           uartWriteBytesFromISR(UART_PORT, data, 1);
         }
+
+        static int64_t lastTime;
+        int64_t tm = esp_timer_get_time();
+        gDelta = tm - lastTime;
+        lastTime = tm;
       }
       lastClkPhase = clkPhase;
-      // lastState = currentState;
+    }
+
+    gRuntime = esp_timer_get_time() - before;
+
+    if (gRuntime > 100) {
+      gMaxRuntime = gRuntime;
     }
   }
 }
@@ -145,9 +159,11 @@ extern "C" void app_main()
   ESP_ERROR_CHECK(esp_event_loop_create_default());
   ESP_ERROR_CHECK(example_connect());
 
-  SemaphoreHandle_t tickSemphr = xSemaphoreCreateBinary();
-  timerGroup0Init(100, tickSemphr);
+  TaskHandle_t tickTaskHandle;
+  xTaskCreatePinnedToCore(tickTask, "tick", 8192, nullptr, 100,
+    &tickTaskHandle, tskNO_AFFINITY);
 
-  xTaskCreatePinnedToCore(tickTask, "tick", 8192, tickSemphr, configMAX_PRIORITIES - 1,
-    nullptr, tskNO_AFFINITY);
+  timerGroup0Init(100, tickTaskHandle);
+
+  vTaskDelay(portMAX_DELAY);
 }
