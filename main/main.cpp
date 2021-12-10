@@ -8,8 +8,15 @@
 #include <nvs_flash.h>
 #include <protocol_examples_common.h>
 
+#include "UartISR.h"
+
 #define LED GPIO_NUM_2
 #define PRINT_LINK_STATE false
+#define USB_MIDI true
+
+#define UART_PORT UART_NUM_1
+#define TX_PIN 15
+#define RX_PIN 12
 
 void IRAM_ATTR timer_group0_isr(void* userParam)
 {
@@ -61,15 +68,37 @@ void printTask(void* userParam)
   }
 }
 
+void initUartPort(uart_port_t port, int txPin, int rxPin)
+{
+  uart_config_t uart_config = {
+      .baud_rate = 31250,
+      .data_bits = UART_DATA_8_BITS,
+      .parity = UART_PARITY_DISABLE,
+      .stop_bits = UART_STOP_BITS_1,
+      .flow_ctrl = UART_HW_FLOWCTRL_DISABLE,
+      .rx_flow_ctrl_thresh = 122,
+  };
+
+  if (USB_MIDI) {
+    uart_config.baud_rate = 115200;
+  }
+
+  uart_param_config(port, &uart_config);
+  uart_set_pin(port, txPin, rxPin, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
+  uart_driver_install(port, 512, 0, 0, NULL, 0);
+}
+
 void tickTask(void* userParam)
 {
   SemaphoreHandle_t handle = static_cast<SemaphoreHandle_t>(userParam);
   ableton::Link link(120.0f);
   link.enable(true);
 
+  initUartPort(UART_PORT, TX_PIN, RX_PIN);
+
   if (PRINT_LINK_STATE)
   {
-    xTaskCreate(printTask, "print", 8192, &link, 1, nullptr);
+    xTaskCreatePinnedToCore(printTask, "print", 8192, &link, 1, nullptr, tskNO_AFFINITY);
   }
 
   gpio_set_direction(LED, GPIO_MODE_OUTPUT);
@@ -80,19 +109,45 @@ void tickTask(void* userParam)
 
     const auto state = link.captureAudioSessionState();
     const auto phase = state.phaseAtTime(link.clock().micros(), 1.);
+    const auto beat = state.beatAtTime(link.clock().micros(), 1.);
     gpio_set_level(LED, fmodf(phase, 1.) < 0.1);
+
+    // MIDI clock
+    {
+      // static int lastState;
+      // const int currentState = beat * 24;
+      static float lastClkPhase; 
+      const float clkPhase = state.phaseAtTime(link.clock().micros(), 1.0/24.0);
+
+      // if (currentState > lastState) {
+      if (clkPhase - lastClkPhase < 0) {
+        if (USB_MIDI)
+        {
+          uint8_t data[4] = { 0x0f, 0xf8, 0x00, 0x00 };
+          uartWriteBytesFromISR(UART_PORT, data, 4);
+        }
+        else
+        {
+          uint8_t data[1] = { 0xf8 };
+          uartWriteBytesFromISR(UART_PORT, data, 1);
+        }
+      }
+      lastClkPhase = clkPhase;
+      // lastState = currentState;
+    }
   }
 }
 
 extern "C" void app_main()
 {
   ESP_ERROR_CHECK(nvs_flash_init());
-  esp_netif_init();
+  ESP_ERROR_CHECK(esp_netif_init());
   ESP_ERROR_CHECK(esp_event_loop_create_default());
   ESP_ERROR_CHECK(example_connect());
 
   SemaphoreHandle_t tickSemphr = xSemaphoreCreateBinary();
   timerGroup0Init(100, tickSemphr);
 
-  xTaskCreate(tickTask, "tick", 8192, tickSemphr, configMAX_PRIORITIES - 1, nullptr);
+  xTaskCreatePinnedToCore(tickTask, "tick", 8192, tickSemphr, configMAX_PRIORITIES - 1,
+    nullptr, tskNO_AFFINITY);
 }
