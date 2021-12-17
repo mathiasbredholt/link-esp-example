@@ -9,6 +9,7 @@
 #include <protocol_examples_common.h>
 
 #include "UartISR.h"
+#include "esp_wifi.h"
 
 #define LED GPIO_NUM_2
 #define PRINT_LINK_STATE false
@@ -18,21 +19,39 @@
 #define TX_PIN 15
 #define RX_PIN 12
 
-int gDelta = 0;
-int gRuntime = 0;
-int gMaxRuntime = -1;
+#define BUF_SIZE 20
+#define FRAME_DUR_US 500 // 20 * 500 us = 10 ms total buffer duration
 
-void IRAM_ATTR timer_group0_isr(void* userParam)
+static bool gBuf[BUF_SIZE] = {0};
+static int gBufIdx = 0;
+
+void IRAM_ATTR timer_group0_isr(void *userParam)
 {
   static BaseType_t xHigherPriorityTaskWoken = pdFALSE;
 
   timer_group_clr_intr_status_in_isr(TIMER_GROUP_0, TIMER_0);
   timer_group_enable_alarm_in_isr(TIMER_GROUP_0, TIMER_0);
 
-  vTaskNotifyGiveFromISR(userParam, &xHigherPriorityTaskWoken);
-  if (xHigherPriorityTaskWoken)
-  {
-    portYIELD_FROM_ISR();
+  if (gBuf[gBufIdx]) {
+#ifdef USB_MIDI
+      uint8_t data[4] = {0x0f, 0xf8, 0x00, 0x00};
+      uartWriteBytesFromISR(UART_PORT, data, 4);
+#else
+      uint8_t data[1] = {0xf8};
+      uartWriteBytesFromISR(UART_PORT, data, 1);
+#endif
+  }
+
+  ++gBufIdx;
+  if (gBufIdx >= BUF_SIZE) {
+    gBufIdx = 0;
+
+    // Notifiy tick task to fill buffer
+    vTaskNotifyGiveFromISR(userParam, &xHigherPriorityTaskWoken);
+
+    if (xHigherPriorityTaskWoken) {
+      portYIELD_FROM_ISR();
+    }
   }
 }
 
@@ -49,31 +68,26 @@ void timerGroup0Init(int timerPeriodUS, void* userParam)
   timer_set_counter_value(TIMER_GROUP_0, TIMER_0, 0);
   timer_set_alarm_value(TIMER_GROUP_0, TIMER_0, timerPeriodUS);
   timer_enable_intr(TIMER_GROUP_0, TIMER_0);
-  timer_isr_register(TIMER_GROUP_0, TIMER_0, &timer_group0_isr, userParam, 0, nullptr);
+  // Allocate interrupt with high priority ESP_INTR_FLAG_LEVEL3
+  timer_isr_register(TIMER_GROUP_0, TIMER_0, &timer_group0_isr, userParam,
+    ESP_INTR_FLAG_LEVEL3, nullptr);
 
   timer_start(TIMER_GROUP_0, TIMER_0);
 }
 
-void printTask(void* userParam)
+void printTask(void *userParam)
 {
-  auto link = static_cast<ableton::Link*>(userParam);
-  const auto quantum = 4.0;
-
-  while (true)
-  {
-    // const auto sessionState = link->captureAppSessionState();
-    // const auto numPeers = link->numPeers();
-    // const auto time = link->clock().micros();
-    // const auto beats = sessionState.beatAtTime(time, quantum);
-    // std::cout << std::defaultfloat << "| peers: " << numPeers << " | "
-    //           << "tempo: " << sessionState.tempo() << " | " << std::fixed
-    //           << "beats: " << beats << " |" << std::endl;
-    std::cout << "delta: " << gDelta << " runtime: " << gRuntime << "\n";
-    if (gMaxRuntime > -1) {
-      std::cout << "ERROR: Task didn't finish in time (" << gMaxRuntime << ")\n";
-      gMaxRuntime = -1;
-    }
-    vTaskDelay(100 / portTICK_PERIOD_MS);
+  while (true) {
+    auto link = static_cast<ableton::Link *>(userParam);
+    const auto quantum = 4.0;
+    const auto sessionState = link->captureAppSessionState();
+    const auto numPeers = link->numPeers();
+    const auto time = link->clock().micros();
+    const auto beats = sessionState.beatAtTime(time, quantum);
+    std::cout << std::defaultfloat << "| peers: " << numPeers << " | "
+              << "tempo: " << sessionState.tempo() << " | " << std::fixed
+              << "beats: " << beats << " |" << std::endl;
+    vTaskDelay(2000 / portTICK_PERIOD_MS);
   }
 }
 
@@ -97,57 +111,28 @@ void initUartPort(uart_port_t port, int txPin, int rxPin)
   uart_driver_install(port, 512, 0, 0, NULL, 0);
 }
 
-void tickTask(void* userParam)
+void tickTask(void *userParam)
 {
   ableton::Link link(120.0f);
   link.enable(true);
 
   initUartPort(UART_PORT, TX_PIN, RX_PIN);
 
-  if (PRINT_LINK_STATE)
-  {
-    xTaskCreatePinnedToCore(printTask, "print", 8192, &link, 1, nullptr, tskNO_AFFINITY);
+  if (PRINT_LINK_STATE) {
+    xTaskCreate(printTask, "print", 8192, &link, 1, nullptr);
   }
 
-  gpio_set_direction(LED, GPIO_MODE_OUTPUT);
-
-  while (true)
-  {
+  while (true) {
     ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
-
-    int64_t before = esp_timer_get_time();
-
     const auto state = link.captureAudioSessionState();
-
-    // MIDI clock
+    static int lastTick;
+    for (int i = 0; i < BUF_SIZE; ++i)
     {
-      static float lastClkPhase; 
-      const float clkPhase = state.phaseAtTime(link.clock().micros(), 1.0/24.0);
-
-      if (clkPhase - lastClkPhase < 0) {
-        if (USB_MIDI)
-        {
-          uint8_t data[4] = { 0x0f, 0xf8, 0x00, 0x00 };
-          uartWriteBytesFromISR(UART_PORT, data, 4);
-        }
-        else
-        {
-          uint8_t data[1] = { 0xf8 };
-          uartWriteBytesFromISR(UART_PORT, data, 1);
-        }
-
-        static int64_t lastTime;
-        int64_t tm = esp_timer_get_time();
-        gDelta = tm - lastTime;
-        lastTime = tm;
-      }
-      lastClkPhase = clkPhase;
-    }
-
-    gRuntime = esp_timer_get_time() - before;
-
-    if (gRuntime > 100) {
-      gMaxRuntime = gRuntime;
+      const int tick = state.beatAtTime(
+        link.clock().micros() +
+        std::chrono::microseconds(i * FRAME_DUR_US), 1.) * 24.;
+      gBuf[i] = tick != lastTick;
+      lastTick = tick;
     }
   }
 }
@@ -159,11 +144,11 @@ extern "C" void app_main()
   ESP_ERROR_CHECK(esp_event_loop_create_default());
   ESP_ERROR_CHECK(example_connect());
 
+  esp_wifi_set_ps(WIFI_PS_NONE);
+
   TaskHandle_t tickTaskHandle;
-  xTaskCreatePinnedToCore(tickTask, "tick", 8192, nullptr, 100,
-    &tickTaskHandle, tskNO_AFFINITY);
+  xTaskCreate(tickTask, "tick", 8192, nullptr, 30, &tickTaskHandle);
 
-  timerGroup0Init(100, tickTaskHandle);
-
+  timerGroup0Init(FRAME_DUR_US, tickTaskHandle);
   vTaskDelay(portMAX_DELAY);
 }
