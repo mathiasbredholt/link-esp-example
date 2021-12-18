@@ -19,39 +19,25 @@
 #define TX_PIN 15
 #define RX_PIN 12
 
-#define BUF_SIZE 20
-#define FRAME_DUR_US 500 // 20 * 500 us = 10 ms total buffer duration
+#define BUF_SIZE 40
+#define FRAME_DUR_US 250 // 40 * 250 us = 10 ms total buffer duration
 
-static bool gBuf[BUF_SIZE] = {0};
-static int gBufIdx = 0;
+QueueHandle_t gBuf;
 
 void IRAM_ATTR timer_group0_isr(void *userParam)
 {
-  static BaseType_t xHigherPriorityTaskWoken = pdFALSE;
-
   timer_group_clr_intr_status_in_isr(TIMER_GROUP_0, TIMER_0);
   timer_group_enable_alarm_in_isr(TIMER_GROUP_0, TIMER_0);
 
-  if (gBuf[gBufIdx]) {
+  uint8_t clk;
+  if (xQueueReceiveFromISR(gBuf, &clk, 0) && clk) {
 #ifdef USB_MIDI
       uint8_t data[4] = {0x0f, 0xf8, 0x00, 0x00};
-      uartWriteBytesFromISR(UART_PORT, data, 4);
+      uart_write_bytes(UART_PORT, (char*) data, 4);
 #else
       uint8_t data[1] = {0xf8};
-      uartWriteBytesFromISR(UART_PORT, data, 1);
+      uart_write_bytes(UART_PORT, (char*) data, 4);
 #endif
-  }
-
-  ++gBufIdx;
-  if (gBufIdx >= BUF_SIZE) {
-    gBufIdx = 0;
-
-    // Notifiy tick task to fill buffer
-    vTaskNotifyGiveFromISR(userParam, &xHigherPriorityTaskWoken);
-
-    if (xHigherPriorityTaskWoken) {
-      portYIELD_FROM_ISR();
-    }
   }
 }
 
@@ -122,33 +108,43 @@ void tickTask(void *userParam)
     xTaskCreate(printTask, "print", 8192, &link, 1, nullptr);
   }
 
+  // Initialize time offset
+  std::chrono::microseconds offset = link.clock().micros();
+
   while (true) {
-    ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
     const auto state = link.captureAudioSessionState();
     static int lastTick;
-    for (int i = 0; i < BUF_SIZE; ++i)
-    {
-      const int tick = state.beatAtTime(
-        link.clock().micros() +
-        std::chrono::microseconds(i * FRAME_DUR_US), 1.) * 24.;
-      gBuf[i] = tick != lastTick;
-      lastTick = tick;
-    }
+    const int tick = state.beatAtTime(offset, 1.) * 24.;
+    uint8_t clk = tick != lastTick;
+    // Send clock value to buffer
+    xQueueSend(gBuf, &clk, portMAX_DELAY);
+    lastTick = tick;
+    offset += std::chrono::microseconds(FRAME_DUR_US);
   }
 }
 
 extern "C" void app_main()
 {
-  ESP_ERROR_CHECK(nvs_flash_init());
-  ESP_ERROR_CHECK(esp_netif_init());
-  ESP_ERROR_CHECK(esp_event_loop_create_default());
-  ESP_ERROR_CHECK(example_connect());
+  // Run init task on core 1, to ensure that the clock interrupt is running on core 1
+  xTaskCreatePinnedToCore([](void*){
+    ESP_ERROR_CHECK(nvs_flash_init());
+    ESP_ERROR_CHECK(esp_netif_init());
+    ESP_ERROR_CHECK(esp_event_loop_create_default());
+    ESP_ERROR_CHECK(example_connect());
 
-  esp_wifi_set_ps(WIFI_PS_NONE);
+    esp_wifi_set_ps(WIFI_PS_NONE);
 
-  TaskHandle_t tickTaskHandle;
-  xTaskCreate(tickTask, "tick", 8192, nullptr, 30, &tickTaskHandle);
+    gBuf = xQueueCreate(BUF_SIZE, 1);
 
-  timerGroup0Init(FRAME_DUR_US, tickTaskHandle);
-  vTaskDelay(portMAX_DELAY);
+    TaskHandle_t tickTaskHandle;
+    xTaskCreate(tickTask, "tick", 8192, nullptr, 10, &tickTaskHandle);
+
+    timerGroup0Init(FRAME_DUR_US, &tickTaskHandle);
+
+    // Delete this task
+    vTaskDelete(nullptr);
+  }, "init-link", 4096, nullptr, 1, nullptr, 1);
+
+  // Delete this task
+  vTaskDelete(nullptr);
 }
