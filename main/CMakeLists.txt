@@ -1,1 +1,1 @@
-idf_component_register(SRCS main.cpp UartISR.c)
+idf_component_register(SRCS main.cpp)

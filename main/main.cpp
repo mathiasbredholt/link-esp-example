@@ -1,5 +1,6 @@
 #include <ableton/Link.hpp>
 #include <driver/gpio.h>
+#include <driver/uart.h>
 #include <driver/timer.h>
 #include <esp_event.h>
 #include <freertos/FreeRTOS.h>
@@ -8,7 +9,6 @@
 #include <nvs_flash.h>
 #include <protocol_examples_common.h>
 
-#include "UartISR.h"
 #include "esp_wifi.h"
 
 #define LED GPIO_NUM_2
@@ -21,6 +21,7 @@
 
 #define BUF_SIZE 40
 #define FRAME_DUR_US 250 // 40 * 250 us = 10 ms total buffer duration
+#define FRAME_DUR (FRAME_DUR_US / 1000000.f) // frame duration in seconds
 
 QueueHandle_t gBuf;
 
@@ -97,6 +98,23 @@ void initUartPort(uart_port_t port, int txPin, int rxPin)
   uart_driver_install(port, 512, 0, 0, NULL, 0);
 }
 
+float generatePhase(float linkPhase, float tempo) {
+  static float phasor;
+
+  // Calculate phase increment (beats/s times ppqn)
+  float dO = tempo / 60 * 24;
+
+  // Subtract from phase retrieved from Link
+  dO += (linkPhase - phasor) * 25.f; // gain phase error
+
+  // Mutiply with frame duration
+  dO = dO * FRAME_DUR;
+
+  phasor = fmodf(phasor + dO, 1.0);
+
+  return linkPhase;
+}
+
 void tickTask(void *userParam)
 {
   ableton::Link link(120.0f);
@@ -113,12 +131,16 @@ void tickTask(void *userParam)
 
   while (true) {
     const auto state = link.captureAudioSessionState();
-    static int lastTick;
-    const int tick = state.beatAtTime(offset, 1.) * 24.;
-    uint8_t clk = tick != lastTick;
+
+    const float linkPhase = state.phaseAtTime(offset, 1./24.) * 24.; // 24 ppqn
+    const float phase = generatePhase(linkPhase, state.tempo());
+    static float lastPhase;
+
+    uint8_t clk = phase - lastPhase < -0.5f; // check for falling edge
+    lastPhase = phase;
+
     // Send clock value to buffer
     xQueueSend(gBuf, &clk, portMAX_DELAY);
-    lastTick = tick;
     offset += std::chrono::microseconds(FRAME_DUR_US);
   }
 }
