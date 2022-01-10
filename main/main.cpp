@@ -37,7 +37,7 @@ void IRAM_ATTR timer_group0_isr(void *userParam)
       uart_write_bytes(UART_PORT, (char*) data, 4);
 #else
       uint8_t data[1] = {0xf8};
-      uart_write_bytes(UART_PORT, (char*) data, 4);
+      uart_write_bytes(UART_PORT, (char*) data, 1);
 #endif
   }
 }
@@ -102,17 +102,16 @@ float generatePhase(float linkPhase, float tempo) {
   static float phasor;
 
   // Calculate phase increment (beats/s times ppqn)
-  float dO = tempo / 60 * 24;
+  float dO = tempo / 60.f * 24.f;
 
   // Subtract from phase retrieved from Link
-  dO += (linkPhase - phasor) * 25.f; // gain phase error
+  dO += (linkPhase - phasor) * 15.f; // gain phase error
 
   // Mutiply with frame duration
   dO = dO * FRAME_DUR;
 
-  phasor = fmodf(phasor + dO, 1.0);
-
-  return linkPhase;
+  phasor = fmodf(phasor + dO, 1.0f);
+  return phasor;
 }
 
 void tickTask(void *userParam)
